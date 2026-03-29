@@ -37,7 +37,8 @@ ENV HF_HOME=/app/models
 
 # Pre-download the model weights at build time so cold starts are fast.
 # This makes the image ~5-8 GB but avoids downloading on every pod start.
-RUN python3 -c "from diffusers import WanPipeline; WanPipeline.from_pretrained('Wan-AI/Wan2.1-T2V-1.3B')"
+# Use huggingface_hub snapshot_download (download-only, no GPU/model loading).
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B')"
 
 # Pre-download Real-ESRGAN anime upscaler weights (~17 MB)
 RUN mkdir -p /app/weights && \
