@@ -1,5 +1,4 @@
-torch>=2.1.0
-torchvision>=0.16.0
+# torch & torchvision installed separately in Dockerfile from PyTorch CUDA wheels
 diffusers>=0.32.0
 transformers>=4.45.0
 accelerate>=0.34.0

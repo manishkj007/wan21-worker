@@ -9,11 +9,20 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
 
-# Install build toolchain pins first, then main deps
-RUN pip3 install --no-cache-dir "setuptools<70" "numpy<2" cython && \
-    pip3 install --no-cache-dir -r requirements.txt runpod opencv-python-headless
+# 1) Install PyTorch from official pre-built CUDA 12.1 wheels (no compilation)
+RUN pip3 install --no-cache-dir \
+    "torch>=2.1.0" "torchvision>=0.16.0" \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# 2) Pin numpy<2 + setuptools for basicsr compatibility
+RUN pip3 install --no-cache-dir "setuptools<70" "numpy<2" cython
+
+# 3) Install basicsr/realesrgan WITHOUT building CUDA extensions
+#    (the runtime image has no nvcc; inference still uses CUDA via PyTorch wheels)
+COPY requirements.txt .
+ENV BASICSR_EXT=False
+RUN pip3 install --no-cache-dir -r requirements.txt runpod opencv-python-headless
 
 # ── Wav2Lip for lip-sync ─────────────────────────────────────────────────
 RUN git clone --depth 1 https://github.com/Rudrabha/Wav2Lip.git /app/Wav2Lip && \
