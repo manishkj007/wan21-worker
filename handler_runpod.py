@@ -25,7 +25,6 @@ import base64
 import subprocess
 import glob
 
-import torch
 import runpod
 
 pipe = None
@@ -33,9 +32,24 @@ upsampler = None
 wav2lip_model = None
 device = "cuda"
 
+# Lazy import torch — don't fail at module level
+torch = None
+
+def ensure_torch():
+    global torch, device
+    if torch is not None:
+        return
+    import importlib
+    torch = importlib.import_module("torch")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Init] torch loaded, device={device}, CUDA={torch.cuda.is_available()}")
+
 
 def load_model():
     global pipe
+    if pipe is not None:
+        return
+    ensure_torch()
     from diffusers import WanPipeline
 
     model_size = os.environ.get("WAN_MODEL_SIZE", "1.3B")
@@ -61,6 +75,7 @@ def load_upscaler():
     global upsampler
     if upsampler is not None:
         return upsampler
+    ensure_torch()
 
     try:
         from realesrgan import RealESRGANer
@@ -188,6 +203,7 @@ def load_wav2lip():
     global wav2lip_model
     if wav2lip_model is not None:
         return wav2lip_model
+    ensure_torch()
 
     try:
         import sys
@@ -466,14 +482,18 @@ def handle_lip_sync(inp):
 
 def handler(event):
     """RunPod handler: routes between generate and lip_sync actions."""
-    inp = event.get("input", {})
-    action = inp.get("action", "generate")
+    try:
+        inp = event.get("input", {})
+        action = inp.get("action", "generate")
 
-    if action == "lip_sync":
-        return handle_lip_sync(inp)
+        if action == "lip_sync":
+            return handle_lip_sync(inp)
 
-    # ── Default: text-to-video generation ─────────────────────────
-    prompt = inp.get("prompt", "")
+        # ── Default: text-to-video generation ─────────────────────────
+        # Lazy-load model on first request
+        load_model()
+
+        prompt = inp.get("prompt", "")
     if not prompt:
         return {"error": "prompt is required"}
 
@@ -561,7 +581,12 @@ def handler(event):
         "enhanced": do_upscale or do_interpolate,
     }
 
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
 
-# Load on cold start
-load_model()
+
+# Models load lazily on first request, not at cold start.
+# This prevents the worker from crashing if model download is incomplete.
 runpod.serverless.start({"handler": handler})
