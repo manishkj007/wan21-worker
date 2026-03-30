@@ -6,10 +6,13 @@ import os, uuid, time, base64
 # Redirect all caches to RAM-backed tmpfs to avoid disk-quota issues on RunPod.
 # The container disk is nearly full from the base image layers, so any writes
 # (model download, temp files) must go to /dev/shm instead.
+# Force-override (not setdefault) because the Dockerfile sets HF_HOME=/runpod-volume/models
+# which doesn't exist without a network volume.
 if os.path.isdir("/dev/shm"):
-    os.environ.setdefault("HF_HOME", "/dev/shm/hf")
-    os.environ.setdefault("TRANSFORMERS_CACHE", "/dev/shm/hf")
-    os.environ.setdefault("XDG_CACHE_HOME", "/dev/shm/cache")
+    os.environ["HF_HOME"] = "/dev/shm/hf"
+    os.environ["TRANSFORMERS_CACHE"] = "/dev/shm/hf"
+    os.environ["XDG_CACHE_HOME"] = "/dev/shm/cache"
+    os.environ["TMPDIR"] = "/dev/shm"
     TMPDIR = "/dev/shm"
 else:
     TMPDIR = "/tmp"
