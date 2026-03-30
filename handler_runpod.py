@@ -14,15 +14,18 @@ Deploy with WAN_MODE env var:
 
 import os, uuid, time, base64, io
 
-# Force ALL caches/temp to /dev/shm (RAM tmpfs). Network volume has quota issues.
+# Model cache: use the pre-baked /app/models from Docker build.
+# For temp files (mp4 encoding), use /dev/shm (RAM) if available.
+MODEL_DIR = "/app/models"
 if os.path.isdir("/dev/shm"):
-    os.environ["HF_HOME"] = "/dev/shm/hf"
-    os.environ["TRANSFORMERS_CACHE"] = "/dev/shm/hf"
-    os.environ["XDG_CACHE_HOME"] = "/dev/shm/cache"
-    os.environ["TMPDIR"] = "/dev/shm"
     TMPDIR = "/dev/shm"
 else:
     TMPDIR = "/tmp"
+
+# Set HF cache so from_pretrained() finds the pre-downloaded model
+os.environ["HF_HOME"] = MODEL_DIR
+os.environ["TRANSFORMERS_CACHE"] = MODEL_DIR
+os.environ["TMPDIR"] = TMPDIR
 
 import runpod
 
