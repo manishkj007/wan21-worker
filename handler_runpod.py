@@ -3,19 +3,26 @@ Lazy model load on first request. Tiny handler = fast worker start."""
 
 import os, uuid, time, base64
 
-# Redirect all caches to RAM-backed tmpfs to avoid disk-quota issues on RunPod.
-# The container disk is nearly full from the base image layers, so any writes
-# (model download, temp files) must go to /dev/shm instead.
-# Force-override (not setdefault) because the Dockerfile sets HF_HOME=/runpod-volume/models
-# which doesn't exist without a network volume.
-if os.path.isdir("/dev/shm"):
+# Use network volume (/runpod-volume) for persistent model cache so models
+# survive across cold starts. Use /dev/shm (RAM tmpfs) for temp files only.
+# The endpoint MUST be pinned to the same data center as the network volume (EU-CZ-1).
+VOLUME = "/runpod-volume"
+if os.path.isdir(VOLUME) and os.access(VOLUME, os.W_OK):
+    # Network volume is mounted — use it for model cache (persistent across workers)
+    os.environ["HF_HOME"] = f"{VOLUME}/models"
+    os.environ["TRANSFORMERS_CACHE"] = f"{VOLUME}/models"
+    os.environ["XDG_CACHE_HOME"] = f"{VOLUME}/cache"
+    print(f"[init] Using network volume {VOLUME} for model cache")
+elif os.path.isdir("/dev/shm"):
+    # Fallback: no volume mounted, use RAM tmpfs (models re-download every cold start)
     os.environ["HF_HOME"] = "/dev/shm/hf"
     os.environ["TRANSFORMERS_CACHE"] = "/dev/shm/hf"
     os.environ["XDG_CACHE_HOME"] = "/dev/shm/cache"
-    os.environ["TMPDIR"] = "/dev/shm"
-    TMPDIR = "/dev/shm"
-else:
-    TMPDIR = "/tmp"
+    print("[init] WARNING: No network volume, using /dev/shm (models will re-download)")
+
+# Always use /dev/shm for temp files (video output) to avoid filling container disk
+TMPDIR = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+os.environ["TMPDIR"] = TMPDIR
 
 import runpod
 
