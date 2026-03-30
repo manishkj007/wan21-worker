@@ -2,10 +2,19 @@
 Lazy model load on first request. Tiny handler = fast worker start."""
 
 import os, uuid, time, base64
-import runpod
 
-# Use RAM-backed tmpfs to avoid disk-quota issues on RunPod serverless
-TMPDIR = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+# Redirect all caches to RAM-backed tmpfs to avoid disk-quota issues on RunPod.
+# The container disk is nearly full from the base image layers, so any writes
+# (model download, temp files) must go to /dev/shm instead.
+if os.path.isdir("/dev/shm"):
+    os.environ.setdefault("HF_HOME", "/dev/shm/hf")
+    os.environ.setdefault("TRANSFORMERS_CACHE", "/dev/shm/hf")
+    os.environ.setdefault("XDG_CACHE_HOME", "/dev/shm/cache")
+    TMPDIR = "/dev/shm"
+else:
+    TMPDIR = "/tmp"
+
+import runpod
 
 pipe = None
 device = "cuda"
