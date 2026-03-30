@@ -77,10 +77,13 @@ def load_i2v():
     )
     i2v_pipe = WanImageToVideoPipeline.from_pretrained(
         mid, vae=vae, image_encoder=image_encoder, torch_dtype=torch.bfloat16
-    ).to(device)
+    )
+    # Use CPU offload instead of .to(device) — 14B model needs ~50GB,
+    # this keeps components on CPU and moves to GPU only during forward pass.
+    i2v_pipe.enable_model_cpu_offload()
     try: i2v_pipe.enable_vae_slicing()
     except: pass
-    print(f"[wan-i2v] ready on {device}")
+    print(f"[wan-i2v] ready (cpu_offload, {device})")
     return i2v_pipe
 
 def frames_to_mp4(frames, fps=16):
