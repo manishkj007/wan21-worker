@@ -4,6 +4,9 @@ Lazy model load on first request. Tiny handler = fast worker start."""
 import os, uuid, time, base64
 import runpod
 
+# Use RAM-backed tmpfs to avoid disk-quota issues on RunPod serverless
+TMPDIR = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+
 pipe = None
 device = "cuda"
 _torch = None
@@ -48,7 +51,7 @@ def handler(event):
         out = pipe(prompt=prompt, num_frames=nf, width=w, height=h,
                    guidance_scale=gs, num_inference_steps=steps)
         frames = out.frames[0]
-        mp4 = f"/tmp/{uuid.uuid4()}.mp4"
+        mp4 = f"{TMPDIR}/{uuid.uuid4()}.mp4"
         import imageio.v3 as iio, numpy as np
         iio.imwrite(mp4, [np.array(f) for f in frames], fps=16, codec="libx264")
         dt = time.time() - t0
