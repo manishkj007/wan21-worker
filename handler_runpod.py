@@ -3,22 +3,16 @@ Lazy model load on first request. Tiny handler = fast worker start."""
 
 import os, uuid, time, base64, shutil
 
-# Endpoint pinned to EU-CZ-1 (same DC as network volume wan-models 20GB).
-# Use network volume for persistent HF model cache, /dev/shm for temp video files.
-VOLUME = "/runpod-volume"
-TMPDIR = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
-os.environ["TMPDIR"] = TMPDIR
-
-if os.path.isdir(VOLUME) and os.access(VOLUME, os.W_OK):
-    os.environ["HF_HOME"] = f"{VOLUME}/hf"
-    os.environ["TRANSFORMERS_CACHE"] = f"{VOLUME}/hf"
-    os.environ["XDG_CACHE_HOME"] = f"{VOLUME}/cache"
-    print(f"[init] Network volume mounted at {VOLUME}, using for model cache")
-elif os.path.isdir("/dev/shm"):
+# Force ALL caches/temp to /dev/shm (RAM tmpfs). Network volume has quota issues.
+# /dev/shm on AMPERE_24 is ~32GB, plenty for the 1.3B model (~2.6GB) + temp files.
+if os.path.isdir("/dev/shm"):
     os.environ["HF_HOME"] = "/dev/shm/hf"
     os.environ["TRANSFORMERS_CACHE"] = "/dev/shm/hf"
     os.environ["XDG_CACHE_HOME"] = "/dev/shm/cache"
-    print("[init] No network volume, falling back to /dev/shm")
+    os.environ["TMPDIR"] = "/dev/shm"
+    TMPDIR = "/dev/shm"
+else:
+    TMPDIR = "/tmp"
 
 import runpod
 
@@ -55,20 +49,6 @@ def handler(event):
         prompt = inp.get("prompt", "")
         if not prompt:
             return {"error": "prompt is required"}
-
-        # Special command: clean the network volume
-        if prompt == "__CLEAN_VOLUME__":
-            cleaned = []
-            if os.path.isdir(VOLUME):
-                for name in os.listdir(VOLUME):
-                    p = os.path.join(VOLUME, name)
-                    try:
-                        shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
-                        cleaned.append(name)
-                    except Exception as e:
-                        cleaned.append(f"{name}(ERR:{e})")
-            return {"cleaned": cleaned, "volume": VOLUME, "exists": os.path.isdir(VOLUME)}
-
         load_model()
         nf = min(max(int(inp.get("num_frames", 81)), 17), 121)
         w = int(inp.get("width", 832))
