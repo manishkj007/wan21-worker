@@ -1,10 +1,10 @@
 # ── RunPod Serverless Dockerfile for Wan2.1 T2V + I2V ─────────────────────
-# Pre-downloads the 1.3B T2V model at build time so workers start instantly
-# with no runtime downloads (avoids "no space left on device" on worker disks).
+# Pre-downloads BOTH models at build time:
+#   - T2V 1.3B (~2.6GB)  — text-to-video
+#   - I2V 14B  (~28GB)   — image-to-video (the good stuff)
 #
-# The 14B I2V model is too large to bake in (~28GB). I2V requests will attempt
-# a lazy download; if the worker has sufficient disk/RAM, it works.
-# Otherwise the pipeline falls back to T2V automatically.
+# Total image size: ~35-40GB. Build takes ~20-30 min on first run.
+# Workers start instantly with no runtime downloads.
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 ENV PYTHONUNBUFFERED=1 \
@@ -23,12 +23,20 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu121 && \
     pip3 install --no-cache-dir -r requirements.txt runpod
 
-# Pre-download the 1.3B T2V model during build (~2.6GB, cached in image layer)
+# ── Pre-download T2V 1.3B model (~2.6GB) ──────────────────────────────────
 RUN python3 -c "\
-from diffusers import WanPipeline; \
-import torch; \
-WanPipeline.from_pretrained('Wan-AI/Wan2.1-T2V-1.3B-Diffusers', torch_dtype=torch.float16); \
-print('[build] T2V 1.3B model cached successfully')"
+from huggingface_hub import snapshot_download; \
+print('[build] Downloading T2V 1.3B...'); \
+snapshot_download('Wan-AI/Wan2.1-T2V-1.3B-Diffusers'); \
+print('[build] T2V 1.3B cached!')"
+
+# ── Pre-download I2V 14B model (~28GB) ────────────────────────────────────
+# This is the large download — cached as a Docker layer so it only downloads once.
+RUN python3 -c "\
+from huggingface_hub import snapshot_download; \
+print('[build] Downloading I2V 14B-480P...'); \
+snapshot_download('Wan-AI/Wan2.1-I2V-14B-480P-Diffusers'); \
+print('[build] I2V 14B cached!')"
 
 COPY handler_runpod.py .
 CMD ["python3", "handler_runpod.py"]
