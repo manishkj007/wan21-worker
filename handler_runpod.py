@@ -24,7 +24,7 @@ def load_model():
         return
     torch = ensure_torch()
     from diffusers import WanPipeline
-    mid = f"Wan-AI/Wan2.1-T2V-{os.environ.get('WAN_MODEL_SIZE','1.3B')}"
+    mid = f"Wan-AI/Wan2.1-T2V-{os.environ.get('WAN_MODEL_SIZE','1.3B')}-Diffusers"
     print(f"[wan] loading {mid}")
     pipe = WanPipeline.from_pretrained(mid, torch_dtype=torch.float16).to(device)
     try: pipe.enable_vae_slicing()
