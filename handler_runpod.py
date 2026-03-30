@@ -14,9 +14,12 @@ Deploy with WAN_MODE env var:
 
 import os, uuid, time, base64, io
 
-# Model cache: use the pre-baked /app/models from Docker build.
+# Model cache: use network volume at /runpod-volume/models.
+# Falls back to /app/models if volume not mounted (legacy).
 # For temp files (mp4 encoding), use /dev/shm (RAM) if available.
-MODEL_DIR = "/app/models"
+VOLUME_MODEL_DIR = "/runpod-volume/models"
+LEGACY_MODEL_DIR = "/app/models"
+MODEL_DIR = VOLUME_MODEL_DIR if os.path.isdir(VOLUME_MODEL_DIR) else LEGACY_MODEL_DIR
 if os.path.isdir("/dev/shm"):
     TMPDIR = "/dev/shm"
 else:
@@ -26,6 +29,8 @@ else:
 os.environ["HF_HOME"] = MODEL_DIR
 os.environ["TRANSFORMERS_CACHE"] = MODEL_DIR
 os.environ["TMPDIR"] = TMPDIR
+
+print(f"[init] MODEL_DIR={MODEL_DIR} (volume={'yes' if MODEL_DIR==VOLUME_MODEL_DIR else 'no'})")
 
 import runpod
 
