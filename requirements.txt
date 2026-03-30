@@ -5,3 +5,5 @@ accelerate>=0.34.0
 sentencepiece>=0.2.0
 imageio[ffmpeg]>=2.34.0
 Pillow>=10.0.0
+# I2V needs CLIP image encoder
+open_clip_torch>=2.24.0

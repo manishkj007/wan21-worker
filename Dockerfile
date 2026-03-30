@@ -1,12 +1,18 @@
-# ── Lean RunPod Serverless Dockerfile for Wan2.1 ──────────────────────────
-# nvidia/cuda RUNTIME base (~3.5GB) instead of devel (~18GB) = fast pull + start
-# Model downloads lazily on first request via HuggingFace cache
+# ── Lean RunPod Serverless Dockerfile for Wan2.1 T2V + I2V ────────────────
+# Supports both text-to-video (1.3B/14B) and image-to-video (14B-480P)
+# Models download lazily on first request via HuggingFace cache
+#
+# Deploy modes (set WAN_MODE env var):
+#   WAN_MODE=t2v   → T2V only    (AMPERE_24 GPU OK for 1.3B, ~$0.31/hr)
+#   WAN_MODE=i2v   → I2V only    (needs AMPERE_48, ~$0.47/hr)
+#   WAN_MODE=both  → both models (needs AMPERE_48, ~$0.47/hr)
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/runpod-volume/models \
-    WAN_MODEL_SIZE=1.3B
+    WAN_MODEL_SIZE=1.3B \
+    WAN_MODE=both
 
 WORKDIR /app
 
