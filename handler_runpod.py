@@ -476,8 +476,19 @@ def apply_lip_sync(video_path, audio_path, output_path):
             wav = load_wav(audio_path, 16000)
             mel = melspectrogram(wav)
 
+            # Wav2Lip expects mel windows aligned to video FPS (not fixed-size jumps).
+            # Using 80/fps keeps mouth motion synchronized to spoken audio timing.
             mel_step = 16
-            mel_chunks = [mel[:, i:i+mel_step] for i in range(0, mel.shape[1], mel_step)]
+            mel_idx_multiplier = 80.0 / float(fps)
+            mel_chunks = []
+            i = 0
+            while True:
+                start_idx = int(i * mel_idx_multiplier)
+                if start_idx + mel_step > mel.shape[1]:
+                    mel_chunks.append(mel[:, mel.shape[1] - mel_step:])
+                    break
+                mel_chunks.append(mel[:, start_idx:start_idx + mel_step])
+                i += 1
 
             # Loop video to match audio length
             needed = len(mel_chunks)
