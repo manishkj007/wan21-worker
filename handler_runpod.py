@@ -455,10 +455,11 @@ def load_wav2lip():
 
 
 def apply_lip_sync(video_path, audio_path, output_path):
-    """Audio-driven mouth morph for cartoon lip-sync.
+    """Audio-driven cartoon lip-sync with visible mouth movement.
 
-    Uses smooth radial warp (cv2.remap) to gently open/close the mouth
-    area based on audio energy.  No neural network, no blur, no hard edges.
+    Two-zone warp: jaw region pulls downward (mouth opens), chin follows.
+    Dark oval mouth cavity drawn when energy is high.
+    Produces clearly visible 'talking' effect for cartoon characters.
     """
     import cv2
     import numpy as np
@@ -497,63 +498,100 @@ def apply_lip_sync(video_path, audio_path, output_path):
 
     if energy.max() > 0:
         energy = energy / energy.max()
-    # Temporal smoothing (5-frame moving average for smoother motion)
-    kernel = np.ones(5) / 5.0
+    # Temporal smoothing (3-frame for responsive yet smooth motion)
+    kernel = np.ones(3) / 3.0
     energy = np.convolve(energy, kernel, mode="same").astype(np.float32)
     energy = np.clip(energy, 0.0, 1.0)
 
-    # ── Smooth radial warp parameters ──
     h_frame, w_frame = frames[0].shape[:2]
+
+    # ── Mouth geometry (centre-frame heuristic for cartoon characters) ──
     mouth_cx = w_frame // 2
-    mouth_cy = int(h_frame * 0.58)           # mouth centre (slightly above mid-lower)
-    warp_rx  = int(w_frame * 0.12)            # horizontal radius of warp zone
-    warp_ry  = int(h_frame * 0.08)            # vertical radius of warp zone
-    max_disp = max(3, int(h_frame * 0.025))   # max outward displacement in pixels
+    mouth_cy = int(h_frame * 0.60)           # mouth vertical centre
 
-    # Pre-build normalised displacement field (vectorised, computed once)
-    ys = np.arange(h_frame, dtype=np.float32)[:, np.newaxis]   # (H,1)
-    xs = np.arange(w_frame, dtype=np.float32)[np.newaxis, :]   # (1,W)
-    dx_norm = (xs - mouth_cx) / max(warp_rx, 1)                # (1,W) → (H,W)
-    dy_norm = (ys - mouth_cy) / max(warp_ry, 1)                # (H,1) → (H,W)
-    r2 = dx_norm ** 2 + dy_norm ** 2                            # (H,W)
+    # Jaw warp zone — large ellipse covering mouth + chin area
+    jaw_rx = int(w_frame * 0.18)             # wide horizontal radius
+    jaw_ry = int(h_frame * 0.14)             # tall vertical radius
+    max_jaw_drop = max(6, int(h_frame * 0.07))  # max 7% of frame height (~34px at 480p)
 
-    # Cosine falloff inside ellipse → 1 at centre, 0 at boundary
-    inside = r2 < 1.0
-    strength = np.where(inside,
-                        0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(r2, 0, 1)))),
-                        0.0).astype(np.float32)
+    # Mouth cavity parameters (dark oval drawn on top)
+    mouth_oval_rx = int(w_frame * 0.06)      # mouth opening width
+    mouth_oval_ry_max = max(4, int(h_frame * 0.035))  # max mouth opening height
 
-    # Displacement directions: push outward from mouth centre
-    # Vertical push is dominant; horizontal is subtle
-    unit_disp_y = -(dy_norm * strength)       # above → up, below → down
-    unit_disp_x = -(dx_norm * strength * 0.3) # slight horizontal
+    # Pre-compute coordinate grids
+    ys = np.arange(h_frame, dtype=np.float32)[:, np.newaxis]
+    xs = np.arange(w_frame, dtype=np.float32)[np.newaxis, :]
 
-    # Inner darkening mask (smaller ellipse for "mouth interior" hint)
-    dark_r2 = (dx_norm * 1.8) ** 2 + (dy_norm * 1.3) ** 2     # tighter ellipse
-    dark_mask = np.where(dark_r2 < 1.0,
-                         0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(dark_r2, 0, 1)))),
-                         0.0).astype(np.float32)
+    # Jaw warp: only push DOWNWARD for pixels BELOW mouth_cy (jaw drop)
+    # Pixels above mouth_cy stay put (upper face doesn't move)
+    dy_from_mouth = (ys - mouth_cy) / max(jaw_ry, 1)        # (H,1)
+    dx_from_mouth = (xs - mouth_cx) / max(jaw_rx, 1)        # (1,W)
+    jaw_r2 = dx_from_mouth ** 2 + dy_from_mouth ** 2        # (H,W)
+
+    # Strength: cosine falloff inside ellipse, only for below-mouth pixels
+    below_mouth = (ys > mouth_cy).astype(np.float32)        # 1 below, 0 above
+    jaw_inside = (jaw_r2 < 1.0).astype(np.float32)
+    jaw_strength = jaw_inside * below_mouth * np.where(
+        jaw_r2 < 1.0,
+        0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(jaw_r2, 0, 1)))),
+        0.0
+    ).astype(np.float32)
+
+    # Upper lip lift: slight upward pull just above mouth line
+    above_zone = ((ys > mouth_cy - jaw_ry * 0.4) & (ys <= mouth_cy)).astype(np.float32)
+    lip_dist = np.abs(ys - mouth_cy) / max(jaw_ry * 0.4, 1)
+    lip_strength = above_zone * jaw_inside * np.where(
+        lip_dist < 1.0,
+        0.5 * (1.0 + np.cos(np.pi * np.clip(lip_dist, 0, 1))),
+        0.0
+    ).astype(np.float32) * 0.3   # upper lip moves 30% as much as jaw
 
     # Base remap grids
-    map_x_base = np.repeat(xs, h_frame, axis=0)    # (H,W)
-    map_y_base = np.repeat(ys, w_frame, axis=1)    # (H,W)
+    map_x_base = np.repeat(xs, h_frame, axis=0).astype(np.float32)
+    map_y_base = np.repeat(ys, w_frame, axis=1).astype(np.float32)
+
+    # Pre-compute mouth cavity mask (ellipse around mouth centre)
+    mouth_dy = (ys - mouth_cy) / max(1, 1)   # will be scaled per-frame
+    mouth_dx = (xs - mouth_cx) / max(mouth_oval_rx, 1)
 
     result_frames = []
     for idx, frame in enumerate(frames):
         e = float(energy[idx]) if idx < len(energy) else 0.0
-        if e < 0.05:
+        if e < 0.08:
             result_frames.append(frame)
             continue
 
-        d = e * max_disp
-        map_x = (map_x_base + unit_disp_x * d).astype(np.float32)
-        map_y = (map_y_base + unit_disp_y * d).astype(np.float32)
+        # ── Jaw drop warp ──
+        drop = e * max_jaw_drop
+        # Jaw drops down, upper lip lifts up slightly
+        disp_y = jaw_strength * drop - lip_strength * drop
+        map_y = (map_y_base - disp_y).astype(np.float32)
+        # Slight horizontal stretch at jaw (mouth widens when open)
+        horiz_stretch = jaw_strength * e * 0.15
+        disp_x = dx_from_mouth * jaw_rx * horiz_stretch
+        map_x = (map_x_base - disp_x).astype(np.float32)
+
         warped = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR,
                            borderMode=cv2.BORDER_REFLECT_101)
 
-        # Subtle darkening at the centre to hint at open mouth interior
-        darken = 1.0 - dark_mask * e * 0.35   # at most 35% darker at peak
-        warped = (warped.astype(np.float32) * darken[:, :, np.newaxis]).clip(0, 255).astype(np.uint8)
+        # ── Draw dark mouth cavity oval ──
+        oval_ry = max(2, int(mouth_oval_ry_max * e))
+        if oval_ry > 2:
+            # Elliptical mask for mouth interior
+            m_r2 = mouth_dx ** 2 + ((ys - mouth_cy) / max(oval_ry, 1)) ** 2
+            # Soft edge: cosine falloff
+            cavity_mask = np.where(
+                m_r2 < 1.0,
+                0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(m_r2, 0, 1)))),
+                0.0
+            ).astype(np.float32)
+            # Darken: blend towards dark reddish-brown (cartoon mouth interior)
+            cavity_strength = cavity_mask * min(e * 1.2, 0.85)
+            mouth_color = np.array([30, 20, 45], dtype=np.float32)  # dark interior (BGR)
+            warped = (
+                warped.astype(np.float32) * (1.0 - cavity_strength[:, :, np.newaxis])
+                + mouth_color[np.newaxis, np.newaxis, :] * cavity_strength[:, :, np.newaxis]
+            ).clip(0, 255).astype(np.uint8)
 
         result_frames.append(warped)
 
@@ -573,7 +611,7 @@ def apply_lip_sync(video_path, audio_path, output_path):
     if os.path.exists(final):
         os.replace(final, output_path)
 
-    processed = sum(1 for e in energy if e >= 0.05)
+    processed = sum(1 for e in energy if e >= 0.08)
     print(f"[MouthMorph] Done — {len(result_frames)} frames, {processed} morphed")
     return output_path, {
         "lipsync_mode": "mouth_morph",
