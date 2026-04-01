@@ -91,6 +91,8 @@ def load_i2v():
     print(f"[wan-i2v] ready (cpu_offload, {device})")
     return i2v_pipe
 
+OUTPUT_DIR = "/runpod-volume/output"
+
 def frames_to_mp4(frames, fps=16):
     """Encode list of PIL/ndarray frames to base64 MP4."""
     import imageio.v3 as iio, numpy as np
@@ -102,6 +104,70 @@ def frames_to_mp4(frames, fps=16):
     try: os.remove(mp4)
     except: pass
     return b64, sz
+
+def save_to_volume(b64_data, output_name):
+    """Save base64 video to network volume for overnight persistence."""
+    if not output_name:
+        return
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, f"{output_name}.mp4")
+    with open(out_path, "wb") as f:
+        f.write(base64.b64decode(b64_data))
+    print(f"[save] {out_path} ({os.path.getsize(out_path)} bytes)")
+
+
+def handle_list_outputs(inp):
+    """List generated videos stored on the network volume."""
+    if not os.path.isdir(OUTPUT_DIR):
+        return {"files": [], "total_bytes": 0}
+    files = []
+    total = 0
+    for name in sorted(os.listdir(OUTPUT_DIR)):
+        if name.endswith(".mp4"):
+            sz = os.path.getsize(os.path.join(OUTPUT_DIR, name))
+            files.append({"name": name, "size_bytes": sz})
+            total += sz
+    return {"files": files, "total_bytes": total, "count": len(files)}
+
+
+def handle_get_output(inp):
+    """Retrieve a generated video from the network volume as base64."""
+    filename = inp.get("filename", "")
+    if not filename:
+        return {"error": "filename is required"}
+    # Sanitize: only allow simple filenames, no path traversal
+    safe_name = os.path.basename(filename)
+    fpath = os.path.join(OUTPUT_DIR, safe_name)
+    if not os.path.isfile(fpath):
+        return {"error": f"file not found: {safe_name}"}
+    with open(fpath, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    sz = os.path.getsize(fpath)
+    return {"filename": safe_name, "video_base64": b64, "size_bytes": sz}
+
+
+def handle_clean_outputs(inp):
+    """Remove downloaded videos from the network volume to free space."""
+    filenames = inp.get("filenames", [])
+    if not filenames:
+        # Clean all
+        if os.path.isdir(OUTPUT_DIR):
+            removed = 0
+            for name in os.listdir(OUTPUT_DIR):
+                if name.endswith(".mp4"):
+                    os.remove(os.path.join(OUTPUT_DIR, name))
+                    removed += 1
+            return {"removed": removed}
+        return {"removed": 0}
+    removed = 0
+    for fn in filenames:
+        safe = os.path.basename(fn)
+        fpath = os.path.join(OUTPUT_DIR, safe)
+        if os.path.isfile(fpath):
+            os.remove(fpath)
+            removed += 1
+    return {"removed": removed}
+
 
 def handle_t2v(inp):
     """Text-to-video generation."""
@@ -122,8 +188,14 @@ def handle_t2v(inp):
     b64, sz = frames_to_mp4(frames)
     dt = time.time() - t0
     print(f"[wan-t2v] done {dt:.1f}s {sz}B")
-    return {"video_base64": b64, "duration_seconds": round(nf / 16, 2),
-            "inference_time": round(dt, 1), "file_size_bytes": sz}
+    result = {"video_base64": b64, "duration_seconds": round(nf / 16, 2),
+              "inference_time": round(dt, 1), "file_size_bytes": sz}
+    # Persist to volume if output_name given
+    output_name = inp.get("output_name")
+    if output_name:
+        save_to_volume(b64, output_name)
+        result["saved_to_volume"] = f"{output_name}.mp4"
+    return result
 
 def handle_i2v(inp):
     """Image-to-video generation."""
@@ -163,14 +235,28 @@ def handle_i2v(inp):
     b64, sz = frames_to_mp4(frames)
     dt = time.time() - t0
     print(f"[wan-i2v] done {dt:.1f}s {sz}B")
-    return {"video_base64": b64, "duration_seconds": round(nf / 16, 2),
-            "inference_time": round(dt, 1), "file_size_bytes": sz,
-            "resolution": f"{w}x{h}"}
+    result = {"video_base64": b64, "duration_seconds": round(nf / 16, 2),
+              "inference_time": round(dt, 1), "file_size_bytes": sz,
+              "resolution": f"{w}x{h}"}
+    # Persist to volume if output_name given
+    output_name = inp.get("output_name")
+    if output_name:
+        save_to_volume(b64, output_name)
+        result["saved_to_volume"] = f"{output_name}.mp4"
+    return result
 
 def handler(event):
     try:
         inp = event.get("input", {})
         action = inp.get("action", "t2v")
+
+        # Storage actions (no GPU needed — fast)
+        if action == "list_outputs":
+            return handle_list_outputs(inp)
+        if action == "get_output":
+            return handle_get_output(inp)
+        if action == "clean_outputs":
+            return handle_clean_outputs(inp)
 
         if action == "i2v":
             if WAN_MODE == "t2v":
