@@ -103,6 +103,40 @@ OUTPUT_DIR = "/runpod-volume/output"
 WEIGHTS_DIR = "/runpod-volume/weights"  # weights on network volume for fast cold starts
 WEIGHTS_FALLBACK = "/app/weights"      # fallback if volume not mounted
 
+WAV2LIP_URLS = [
+    # Primary mirror
+    "https://huggingface.co/camenduru/Wav2Lip/resolve/main/wav2lip_gan.pth",
+    # Alternate mirrors
+    "https://huggingface.co/numz/wav2lip_studio/resolve/main/wav2lip_gan.pth",
+    "https://huggingface.co/public-data/Wav2Lip/resolve/main/wav2lip_gan.pth",
+]
+S3FD_PATH = "/root/.cache/torch/hub/checkpoints/s3fd-619a316812.pth"
+S3FD_URLS = [
+    "https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth",
+]
+
+
+def _download_first(urls, dst_path, label):
+    import urllib.request
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    last_err = None
+    for url in urls:
+        try:
+            print(f"[{label}] Downloading from {url}")
+            urllib.request.urlretrieve(url, dst_path)
+            if os.path.exists(dst_path) and os.path.getsize(dst_path) > 1024:
+                return dst_path
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"{label} download failed: {last_err}")
+
+
+def _ensure_s3fd_weights():
+    if os.path.exists(S3FD_PATH):
+        return S3FD_PATH
+    return _download_first(S3FD_URLS, S3FD_PATH, "S3FD")
+
+
 def frames_to_mp4(frames, fps=16):
     """Encode list of PIL/ndarray frames to base64 MP4."""
     import imageio.v3 as iio, numpy as np
@@ -400,13 +434,8 @@ def load_wav2lip():
         if not os.path.exists(model_path):
             model_path = os.path.join(WEIGHTS_FALLBACK, "wav2lip_gan.pth")
         if not os.path.exists(model_path):
-            os.makedirs(WEIGHTS_DIR, exist_ok=True)
             model_path = os.path.join(WEIGHTS_DIR, "wav2lip_gan.pth")
-            print("[Wav2Lip] Downloading to volume …")
-            import urllib.request
-            urllib.request.urlretrieve(
-                "https://github.com/Rudrabha/Wav2Lip/releases/download/v1.0/wav2lip_gan.pth",
-                model_path)
+            _download_first(WAV2LIP_URLS, model_path, "Wav2Lip")
 
         model = W2LModel()
         ckpt = torch.load(model_path, map_location=device)
@@ -457,6 +486,7 @@ def apply_lip_sync(video_path, audio_path, output_path):
             frames = frames[:needed]
 
             # Face detection
+            _ensure_s3fd_weights()
             det = face_alignment.FaceAlignment(
                 face_alignment.LandmarksType.TWO_D, flip_input=False, device=str(device))
 
@@ -473,10 +503,19 @@ def apply_lip_sync(video_path, audio_path, output_path):
                 except:
                     face_rects.append(None)
 
-            # Check if we found any faces at all
+            # If detector fails on cartoon frames, use a center-face heuristic bbox
             face_count = sum(1 for f in face_rects if f is not None)
             if face_count == 0:
-                raise RuntimeError("No faces detected (likely cartoon — using fallback)")
+                h, w = frames[0].shape[:2]
+                bw = int(w * 0.45)
+                bh = int(h * 0.45)
+                x1 = max(0, (w - bw) // 2)
+                y1 = max(0, int(h * 0.18))
+                x2 = min(w, x1 + bw)
+                y2 = min(h, y1 + bh)
+                face_rects = [(y1, y2, x1, x2) for _ in frames]
+                face_count = len(face_rects)
+                print("[Wav2Lip] No face detections; using center-box heuristic")
 
             # Wav2Lip inference
             img_size = 96
@@ -634,14 +673,22 @@ def handle_download_weights(inp):
     if not os.path.exists(wav2lip_path):
         print("[Weights] Downloading Wav2Lip …")
         try:
-            urllib.request.urlretrieve(
-                "https://github.com/Rudrabha/Wav2Lip/releases/download/v1.0/wav2lip_gan.pth",
-                wav2lip_path)
+            _download_first(WAV2LIP_URLS, wav2lip_path, "Wav2Lip")
             results["wav2lip"] = f"downloaded ({os.path.getsize(wav2lip_path)} bytes)"
         except Exception as e:
             results["wav2lip"] = f"failed: {e}"
     else:
         results["wav2lip"] = f"exists ({os.path.getsize(wav2lip_path)} bytes)"
+
+    if not os.path.exists(S3FD_PATH):
+        print("[Weights] Downloading S3FD …")
+        try:
+            _download_first(S3FD_URLS, S3FD_PATH, "S3FD")
+            results["s3fd"] = f"downloaded ({os.path.getsize(S3FD_PATH)} bytes)"
+        except Exception as e:
+            results["s3fd"] = f"failed: {e}"
+    else:
+        results["s3fd"] = f"exists ({os.path.getsize(S3FD_PATH)} bytes)"
 
     return results
 
