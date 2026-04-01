@@ -594,9 +594,35 @@ def apply_lip_sync(video_path, audio_path, output_path):
                 pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
                 for p, fd, orig in zip(pred, coords, origs):
                     y1, y2, x1, x2 = fd
-                    p = cv2.resize(p.astype(np.uint8), (x2-x1, y2-y1))
+                    face_w = x2 - x1
+                    face_h = y2 - y1
+                    p = cv2.resize(p.astype(np.uint8), (face_w, face_h))
+
+                    # Only paste the MOUTH region (bottom 45%) with soft
+                    # feathered blending — keeps eyes/forehead sharp from
+                    # the original frame and avoids the blurry-patch look.
+                    mouth_top = int(face_h * 0.55)
+                    feather = max(1, int(face_h * 0.15))
+
+                    mask = np.zeros((face_h, face_w), dtype=np.float32)
+                    mask[mouth_top:, :] = 1.0
+                    # Soft gradient in the feather zone
+                    f_start = max(0, mouth_top - feather)
+                    for row in range(f_start, mouth_top):
+                        mask[row, :] = (row - f_start) / float(feather)
+                    # Also feather left/right edges (inner 85% full, fade outer)
+                    edge_w = max(1, int(face_w * 0.08))
+                    for col in range(edge_w):
+                        alpha = col / float(edge_w)
+                        mask[:, col] *= alpha
+                        mask[:, face_w - 1 - col] *= alpha
+
+                    mask_3d = mask[:, :, np.newaxis]
+                    orig_face = orig[y1:y2, x1:x2].astype(np.float32)
+                    blended = (p.astype(np.float32) * mask_3d +
+                               orig_face * (1.0 - mask_3d))
                     result = orig.copy()
-                    result[y1:y2, x1:x2] = p
+                    result[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
                     result_frames.append(result)
 
             h, w = result_frames[0].shape[:2]
