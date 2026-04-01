@@ -596,31 +596,36 @@ def apply_lip_sync(video_path, audio_path, output_path):
                     y1, y2, x1, x2 = fd
                     face_w = x2 - x1
                     face_h = y2 - y1
-                    p = cv2.resize(p.astype(np.uint8), (face_w, face_h))
+                    p_resized = cv2.resize(p.astype(np.uint8), (face_w, face_h))
 
-                    # Only paste the MOUTH region (bottom 45%) with soft
-                    # feathered blending — keeps eyes/forehead sharp from
-                    # the original frame and avoids the blurry-patch look.
-                    mouth_top = int(face_h * 0.55)
-                    feather = max(1, int(face_h * 0.15))
+                    orig_face = orig[y1:y2, x1:x2].copy()
 
+                    # ── Color-match Wav2Lip output to original face ──
+                    # Wav2Lip shifts brightness/color; correct it so the
+                    # pasted region blends invisibly with the original.
+                    for ch in range(3):
+                        o_mean = orig_face[:, :, ch].mean()
+                        o_std = max(orig_face[:, :, ch].std(), 1.0)
+                        p_mean = p_resized[:, :, ch].mean()
+                        p_std = max(p_resized[:, :, ch].std(), 1.0)
+                        p_resized[:, :, ch] = np.clip(
+                            (p_resized[:, :, ch].astype(np.float32) - p_mean) * (o_std / p_std) + o_mean,
+                            0, 255).astype(np.uint8)
+
+                    # ── Mouth-only mask with Gaussian feather ──
+                    # Only paste the bottom 35% (mouth/chin), use large
+                    # Gaussian blur for completely seamless edges.
                     mask = np.zeros((face_h, face_w), dtype=np.float32)
+                    mouth_top = int(face_h * 0.65)
                     mask[mouth_top:, :] = 1.0
-                    # Soft gradient in the feather zone
-                    f_start = max(0, mouth_top - feather)
-                    for row in range(f_start, mouth_top):
-                        mask[row, :] = (row - f_start) / float(feather)
-                    # Also feather left/right edges (inner 85% full, fade outer)
-                    edge_w = max(1, int(face_w * 0.08))
-                    for col in range(edge_w):
-                        alpha = col / float(edge_w)
-                        mask[:, col] *= alpha
-                        mask[:, face_w - 1 - col] *= alpha
+                    # Gaussian blur gives a much smoother feather than
+                    # linear gradients — eliminates visible seam lines.
+                    ksize = max(3, int(face_h * 0.35)) | 1  # must be odd
+                    mask = cv2.GaussianBlur(mask, (ksize, ksize), 0)
 
                     mask_3d = mask[:, :, np.newaxis]
-                    orig_face = orig[y1:y2, x1:x2].astype(np.float32)
-                    blended = (p.astype(np.float32) * mask_3d +
-                               orig_face * (1.0 - mask_3d))
+                    blended = (p_resized.astype(np.float32) * mask_3d +
+                               orig_face.astype(np.float32) * (1.0 - mask_3d))
                     result = orig.copy()
                     result[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
                     result_frames.append(result)
