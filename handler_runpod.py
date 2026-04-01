@@ -457,9 +457,8 @@ def load_wav2lip():
 def apply_lip_sync(video_path, audio_path, output_path):
     """Audio-driven mouth morph for cartoon lip-sync.
 
-    Instead of Wav2Lip (which blurs cartoon faces via 96x96 neural crop),
-    this analyses audio energy per frame and warps the original mouth
-    pixels open/closed.  Result: zero quality loss, smooth mouth motion.
+    Uses smooth radial warp (cv2.remap) to gently open/close the mouth
+    area based on audio energy.  No neural network, no blur, no hard edges.
     """
     import cv2
     import numpy as np
@@ -475,7 +474,6 @@ def apply_lip_sync(video_path, audio_path, output_path):
         frames.append(frame)
     cap.release()
     if not frames:
-        # Can't do anything — just overlay audio
         subprocess.run([
             "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
@@ -497,75 +495,67 @@ def apply_lip_sync(video_path, audio_path, output_path):
             chunk = wav[start:end]
             energy[i] = np.sqrt(np.mean(chunk ** 2))
 
-    # Normalise energy to 0‥1; apply slight smoothing for natural motion
     if energy.max() > 0:
         energy = energy / energy.max()
-    # Temporal smoothing (3-frame moving average)
-    kernel = np.ones(3) / 3.0
+    # Temporal smoothing (5-frame moving average for smoother motion)
+    kernel = np.ones(5) / 5.0
     energy = np.convolve(energy, kernel, mode="same").astype(np.float32)
     energy = np.clip(energy, 0.0, 1.0)
 
-    # ── Mouth region: use center-face heuristic for cartoon frames ──
+    # ── Smooth radial warp parameters ──
     h_frame, w_frame = frames[0].shape[:2]
-    # Mouth band: horizontal strip in the centre–lower area of the frame
     mouth_cx = w_frame // 2
-    mouth_cy = int(h_frame * 0.62)          # vertical centre of mouth
-    mouth_hw = int(w_frame * 0.18)          # half-width of mouth region
-    mouth_hh = int(h_frame * 0.06)          # half-height at rest (closed)
-    max_open  = int(h_frame * 0.07)         # max extra pixels to open
+    mouth_cy = int(h_frame * 0.58)           # mouth centre (slightly above mid-lower)
+    warp_rx  = int(w_frame * 0.12)            # horizontal radius of warp zone
+    warp_ry  = int(h_frame * 0.08)            # vertical radius of warp zone
+    max_disp = max(3, int(h_frame * 0.025))   # max outward displacement in pixels
+
+    # Pre-build normalised displacement field (vectorised, computed once)
+    ys = np.arange(h_frame, dtype=np.float32)[:, np.newaxis]   # (H,1)
+    xs = np.arange(w_frame, dtype=np.float32)[np.newaxis, :]   # (1,W)
+    dx_norm = (xs - mouth_cx) / max(warp_rx, 1)                # (1,W) → (H,W)
+    dy_norm = (ys - mouth_cy) / max(warp_ry, 1)                # (H,1) → (H,W)
+    r2 = dx_norm ** 2 + dy_norm ** 2                            # (H,W)
+
+    # Cosine falloff inside ellipse → 1 at centre, 0 at boundary
+    inside = r2 < 1.0
+    strength = np.where(inside,
+                        0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(r2, 0, 1)))),
+                        0.0).astype(np.float32)
+
+    # Displacement directions: push outward from mouth centre
+    # Vertical push is dominant; horizontal is subtle
+    unit_disp_y = -(dy_norm * strength)       # above → up, below → down
+    unit_disp_x = -(dx_norm * strength * 0.3) # slight horizontal
+
+    # Inner darkening mask (smaller ellipse for "mouth interior" hint)
+    dark_r2 = (dx_norm * 1.8) ** 2 + (dy_norm * 1.3) ** 2     # tighter ellipse
+    dark_mask = np.where(dark_r2 < 1.0,
+                         0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(dark_r2, 0, 1)))),
+                         0.0).astype(np.float32)
+
+    # Base remap grids
+    map_x_base = xs.repeat(h_frame, axis=0)   # (H,W)
+    map_y_base = ys.repeat(1, w_frame)         # (H,W)
 
     result_frames = []
     for idx, frame in enumerate(frames):
-        e = energy[idx] if idx < len(energy) else 0.0
+        e = float(energy[idx]) if idx < len(energy) else 0.0
         if e < 0.05:
-            # Mouth closed — keep original frame
             result_frames.append(frame)
             continue
 
-        open_px = int(e * max_open)
-        if open_px < 2:
-            result_frames.append(frame)
-            continue
+        d = e * max_disp
+        map_x = (map_x_base + unit_disp_x * d).astype(np.float32)
+        map_y = (map_y_base + unit_disp_y * d).astype(np.float32)
+        warped = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_REFLECT_101)
 
-        out = frame.copy()
+        # Subtle darkening at the centre to hint at open mouth interior
+        darken = 1.0 - dark_mask * e * 0.35   # at most 35% darker at peak
+        warped = (warped.astype(np.float32) * darken[:, :, np.newaxis]).clip(0, 255).astype(np.uint8)
 
-        # Define mouth slit coordinates
-        my_top = mouth_cy - mouth_hh
-        my_bot = mouth_cy + mouth_hh
-        mx_left = max(0, mouth_cx - mouth_hw)
-        mx_right = min(w_frame, mouth_cx + mouth_hw)
-
-        # Shift pixels below mouth slit downward by open_px
-        # to create an "opening" effect, then darken the gap.
-        shift = open_px
-        if my_bot + shift < h_frame:
-            # Move lower region down
-            out[my_bot + shift:, mx_left:mx_right] = frame[my_bot:h_frame - shift, mx_left:mx_right]
-
-        # Fill the opened gap with a dark mouth interior
-        # Use the average dark colour from the mouth-slit edges
-        slit = frame[my_top:my_bot, mx_left:mx_right]
-        dark_val = np.clip(slit.mean(axis=(0, 1)) * 0.25, 0, 60).astype(np.uint8)
-        out[my_bot:my_bot + shift, mx_left:mx_right] = dark_val
-
-        # Feathered blend at boundaries to eliminate hard edges
-        feather_rows = max(2, shift // 2)
-        for r in range(feather_rows):
-            alpha = r / float(feather_rows)
-            row_top = my_bot - feather_rows + r
-            row_bot = my_bot + shift + r
-            if 0 <= row_top < h_frame:
-                out[row_top, mx_left:mx_right] = np.clip(
-                    frame[row_top, mx_left:mx_right].astype(np.float32) * (1 - alpha * 0.3)
-                    + out[row_top, mx_left:mx_right].astype(np.float32) * (alpha * 0.3),
-                    0, 255).astype(np.uint8)
-            if 0 <= row_bot < h_frame:
-                out[row_bot, mx_left:mx_right] = np.clip(
-                    frame[min(row_bot, h_frame - 1), mx_left:mx_right].astype(np.float32) * alpha
-                    + out[row_bot, mx_left:mx_right].astype(np.float32) * (1 - alpha),
-                    0, 255).astype(np.uint8)
-
-        result_frames.append(out)
+        result_frames.append(warped)
 
     # Write output video
     h_out, w_out = result_frames[0].shape[:2]
