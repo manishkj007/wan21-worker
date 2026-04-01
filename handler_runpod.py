@@ -535,8 +535,8 @@ def apply_lip_sync(video_path, audio_path, output_path):
                          0.0).astype(np.float32)
 
     # Base remap grids
-    map_x_base = xs.repeat(h_frame, axis=0)   # (H,W)
-    map_y_base = ys.repeat(1, w_frame)         # (H,W)
+    map_x_base = np.repeat(xs, h_frame, axis=0)    # (H,W)
+    map_y_base = np.repeat(ys, w_frame, axis=1)    # (H,W)
 
     result_frames = []
     for idx, frame in enumerate(frames):
