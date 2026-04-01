@@ -602,13 +602,7 @@ def handle_lip_sync(inp):
             "upscale_time": round(upscale_time, 1), "total_time": round(elapsed, 1),
             "file_size_bytes": file_size, "upscaled": do_upscale,
             "saved_to_volume": saved}
-              "resolution": f"{w}x{h}"}
-    # Persist to volume if output_name given
-    output_name = inp.get("output_name")
-    if output_name:
-        save_to_volume(b64, output_name)
-        result["saved_to_volume"] = f"{output_name}.mp4"
-    return result
+
 
 def handler(event):
     try:
