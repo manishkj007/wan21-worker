@@ -104,11 +104,10 @@ WEIGHTS_DIR = "/runpod-volume/weights"  # weights on network volume for fast col
 WEIGHTS_FALLBACK = "/app/weights"      # fallback if volume not mounted
 
 WAV2LIP_URLS = [
-    # Primary mirror
-    "https://huggingface.co/camenduru/Wav2Lip/resolve/main/wav2lip_gan.pth",
-    # Alternate mirrors
-    "https://huggingface.co/numz/wav2lip_studio/resolve/main/wav2lip_gan.pth",
-    "https://huggingface.co/public-data/Wav2Lip/resolve/main/wav2lip_gan.pth",
+    # Primary mirror (GitHub release — no auth required)
+    "https://github.com/justinjohn0306/Wav2Lip/releases/download/models/wav2lip_gan.pth",
+    # Alternate mirror (HuggingFace — public repo)
+    "https://huggingface.co/Nekochu/Wav2Lip/resolve/main/wav2lip_gan.pth",
 ]
 S3FD_PATH = "/root/.cache/torch/hub/checkpoints/s3fd-619a316812.pth"
 S3FD_URLS = [
@@ -427,6 +426,7 @@ def load_wav2lip():
         if os.path.isdir(wav2lip_dir) and wav2lip_dir not in sys.path:
             sys.path.insert(0, wav2lip_dir)
 
+        print("[Wav2Lip] Importing model class...")
         from models import Wav2Lip as W2LModel
 
         # Check volume first, then fallback
@@ -435,7 +435,9 @@ def load_wav2lip():
             model_path = os.path.join(WEIGHTS_FALLBACK, "wav2lip_gan.pth")
         if not os.path.exists(model_path):
             model_path = os.path.join(WEIGHTS_DIR, "wav2lip_gan.pth")
+            print(f"[Wav2Lip] Downloading weights to {model_path}...")
             _download_first(WAV2LIP_URLS, model_path, "Wav2Lip")
+        print(f"[Wav2Lip] Loading weights from {model_path} ({os.path.getsize(model_path)} bytes)...")
 
         model = W2LModel()
         ckpt = torch.load(model_path, map_location=device)
@@ -443,9 +445,11 @@ def load_wav2lip():
         model.load_state_dict({k.replace("module.", ""): v for k, v in s.items()})
         model = model.to(device).eval()
         _wav2lip_model = model
-        print("[Wav2Lip] Model loaded")
+        print("[Wav2Lip] Model loaded successfully")
     except Exception as e:
+        import traceback
         print(f"[Wav2Lip] Failed to load: {e}")
+        traceback.print_exc()
         _wav2lip_model = None
     return _wav2lip_model
 
@@ -715,6 +719,57 @@ def handle_download_weights(inp):
     return results
 
 
+def handle_check_deps(inp):
+    """Diagnostic: check all dependencies for lip-sync pipeline."""
+    result = {}
+
+    # Wav2Lip repo
+    wav2lip_dir = "/app/Wav2Lip"
+    result["wav2lip_dir_exists"] = os.path.isdir(wav2lip_dir)
+    if os.path.isdir(wav2lip_dir):
+        result["wav2lip_files"] = os.listdir(wav2lip_dir)[:20]
+
+    # Model import
+    try:
+        if os.path.isdir(wav2lip_dir) and wav2lip_dir not in sys.path:
+            sys.path.insert(0, wav2lip_dir)
+        from models import Wav2Lip as W2LModel
+        result["wav2lip_import"] = "ok"
+    except Exception as e:
+        result["wav2lip_import"] = str(e)
+
+    # Audio module
+    try:
+        from audio import load_wav, melspectrogram
+        result["audio_import"] = "ok"
+    except Exception as e:
+        result["audio_import"] = str(e)
+
+    # face_alignment
+    try:
+        import face_alignment
+        result["face_alignment"] = "ok"
+    except Exception as e:
+        result["face_alignment"] = str(e)
+
+    # Weights
+    vol_w = os.path.join(WEIGHTS_DIR, "wav2lip_gan.pth")
+    app_w = os.path.join(WEIGHTS_FALLBACK, "wav2lip_gan.pth")
+    result["wav2lip_weights_volume"] = f"{os.path.getsize(vol_w)}B" if os.path.exists(vol_w) else "missing"
+    result["wav2lip_weights_fallback"] = f"{os.path.getsize(app_w)}B" if os.path.exists(app_w) else "missing"
+    result["s3fd_weights"] = f"{os.path.getsize(S3FD_PATH)}B" if os.path.exists(S3FD_PATH) else "missing"
+
+    # GPU info
+    try:
+        torch = ensure_torch()
+        result["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
+        result["vram_mb"] = round(torch.cuda.get_device_properties(0).total_mem / 1024**2) if torch.cuda.is_available() else 0
+    except Exception as e:
+        result["gpu"] = str(e)
+
+    return result
+
+
 def handler(event):
     try:
         inp = event.get("input", {})
@@ -729,6 +784,8 @@ def handler(event):
             return handle_clean_outputs(inp)
         if action == "download_weights":
             return handle_download_weights(inp)
+        if action == "check_deps":
+            return handle_check_deps(inp)
 
         if action == "i2v":
             if WAN_MODE == "t2v":
