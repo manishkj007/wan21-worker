@@ -100,6 +100,8 @@ def load_i2v():
     return i2v_pipe
 
 OUTPUT_DIR = "/runpod-volume/output"
+WEIGHTS_DIR = "/runpod-volume/weights"  # weights on network volume for fast cold starts
+WEIGHTS_FALLBACK = "/app/weights"      # fallback if volume not mounted
 
 def frames_to_mp4(frames, fps=16):
     """Encode list of PIL/ndarray frames to base64 MP4."""
@@ -266,12 +268,16 @@ def load_upscaler():
         from basicsr.archs.rrdbnet_arch import RRDBNet
 
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)
-        model_path = "/app/weights/RealESRGAN_x4plus_anime_6B.pth"
+        # Check volume first, then fallback
+        model_path = os.path.join(WEIGHTS_DIR, "RealESRGAN_x4plus_anime_6B.pth")
         if not os.path.exists(model_path):
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            model_path = os.path.join(WEIGHTS_FALLBACK, "RealESRGAN_x4plus_anime_6B.pth")
+        if not os.path.exists(model_path):
+            os.makedirs(WEIGHTS_DIR, exist_ok=True)
+            model_path = os.path.join(WEIGHTS_DIR, "RealESRGAN_x4plus_anime_6B.pth")
             import urllib.request
             url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
-            print("[Upscale] Downloading Real-ESRGAN anime weights …")
+            print("[Upscale] Downloading to volume …")
             urllib.request.urlretrieve(url, model_path)
 
         _upsampler = RealESRGANer(
@@ -389,10 +395,14 @@ def load_wav2lip():
 
         from models import Wav2Lip as W2LModel
 
-        model_path = "/app/weights/wav2lip_gan.pth"
+        # Check volume first, then fallback
+        model_path = os.path.join(WEIGHTS_DIR, "wav2lip_gan.pth")
         if not os.path.exists(model_path):
-            print("[Wav2Lip] Weights not found, downloading …")
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            model_path = os.path.join(WEIGHTS_FALLBACK, "wav2lip_gan.pth")
+        if not os.path.exists(model_path):
+            os.makedirs(WEIGHTS_DIR, exist_ok=True)
+            model_path = os.path.join(WEIGHTS_DIR, "wav2lip_gan.pth")
+            print("[Wav2Lip] Downloading to volume …")
             import urllib.request
             urllib.request.urlretrieve(
                 "https://github.com/Rudrabha/Wav2Lip/releases/download/v1.0/wav2lip_gan.pth",
@@ -604,18 +614,52 @@ def handle_lip_sync(inp):
             "saved_to_volume": saved}
 
 
+def handle_download_weights(inp):
+    """Download weights to network volume (run once to seed volume)."""
+    import urllib.request
+    os.makedirs(WEIGHTS_DIR, exist_ok=True)
+    results = {}
+
+    esrgan_path = os.path.join(WEIGHTS_DIR, "RealESRGAN_x4plus_anime_6B.pth")
+    if not os.path.exists(esrgan_path):
+        print("[Weights] Downloading Real-ESRGAN …")
+        urllib.request.urlretrieve(
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+            esrgan_path)
+        results["realesrgan"] = f"downloaded ({os.path.getsize(esrgan_path)} bytes)"
+    else:
+        results["realesrgan"] = f"exists ({os.path.getsize(esrgan_path)} bytes)"
+
+    wav2lip_path = os.path.join(WEIGHTS_DIR, "wav2lip_gan.pth")
+    if not os.path.exists(wav2lip_path):
+        print("[Weights] Downloading Wav2Lip …")
+        try:
+            urllib.request.urlretrieve(
+                "https://github.com/Rudrabha/Wav2Lip/releases/download/v1.0/wav2lip_gan.pth",
+                wav2lip_path)
+            results["wav2lip"] = f"downloaded ({os.path.getsize(wav2lip_path)} bytes)"
+        except Exception as e:
+            results["wav2lip"] = f"failed: {e}"
+    else:
+        results["wav2lip"] = f"exists ({os.path.getsize(wav2lip_path)} bytes)"
+
+    return results
+
+
 def handler(event):
     try:
         inp = event.get("input", {})
         action = inp.get("action", "t2v")
 
-        # Storage actions (no GPU needed — fast)
+        # Storage/utility actions (no GPU needed — fast)
         if action == "list_outputs":
             return handle_list_outputs(inp)
         if action == "get_output":
             return handle_get_output(inp)
         if action == "clean_outputs":
             return handle_clean_outputs(inp)
+        if action == "download_weights":
+            return handle_download_weights(inp)
 
         if action == "i2v":
             if WAN_MODE == "t2v":
