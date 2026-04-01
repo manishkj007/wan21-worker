@@ -463,8 +463,35 @@ def apply_lip_sync(video_path, audio_path, output_path):
     model = load_wav2lip()
     if model is not None:
         try:
-            from audio import load_wav, melspectrogram
+            # Use librosa directly for mel — avoids Wav2Lip audio.py librosa version mismatch
+            import librosa
             import face_alignment
+
+            _W2L_SR = 16000
+            _W2L_NFFT = 800
+            _W2L_HOP = 200
+            _W2L_WIN = 800
+            _W2L_NMELS = 80
+            _W2L_FMIN = 55
+            _W2L_FMAX = 7600
+            _W2L_REF = 20.0
+            _W2L_MIN = -100.0
+            _W2L_PREEMPH = 0.97
+
+            def _w2l_load_wav(path):
+                wav, _ = librosa.load(path, sr=_W2L_SR)
+                return wav
+
+            def _w2l_melspectrogram(wav):
+                wav = np.append(wav[0], wav[1:] - _W2L_PREEMPH * wav[:-1])
+                D = librosa.stft(y=wav, n_fft=_W2L_NFFT, hop_length=_W2L_HOP, win_length=_W2L_WIN)
+                S = np.abs(D)
+                mel_basis = librosa.filters.mel(sr=_W2L_SR, n_fft=_W2L_NFFT,
+                                                n_mels=_W2L_NMELS, fmin=_W2L_FMIN, fmax=_W2L_FMAX)
+                mel = np.dot(mel_basis, S)
+                mel = 20.0 * np.log10(np.maximum(1e-5, mel)) - _W2L_REF
+                mel = np.clip((2 * 4.0 * (mel - _W2L_MIN) / (-_W2L_MIN)) - 4.0, -4.0, 4.0)
+                return mel
 
             cap = cv2.VideoCapture(video_path)
             fps = cap.get(cv2.CAP_PROP_FPS) or 16
@@ -477,8 +504,8 @@ def apply_lip_sync(video_path, audio_path, output_path):
             if not frames:
                 raise RuntimeError("No frames")
 
-            wav = load_wav(audio_path, 16000)
-            mel = melspectrogram(wav)
+            wav = _w2l_load_wav(audio_path)
+            mel = _w2l_melspectrogram(wav)
 
             # Wav2Lip expects mel windows aligned to video FPS (not fixed-size jumps).
             # Using 80/fps keeps mouth motion synchronized to spoken audio timing.
