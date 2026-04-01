@@ -584,9 +584,16 @@ def apply_lip_sync(video_path, audio_path, output_path):
                 os.replace(final, output_path)
 
             print(f"[Wav2Lip] Done — {len(result_frames)} frames, {face_count} faces")
-            return output_path
+            return output_path, {
+                "lipsync_mode": "wav2lip",
+                "face_count": int(face_count),
+                "processed_frames": int(len(result_frames)),
+            }
         except Exception as e:
             print(f"[Wav2Lip] Failed: {e} — using fallback")
+            fallback_meta = {"lipsync_mode": "fallback", "fallback_error": str(e)[:300]}
+    else:
+        fallback_meta = {"lipsync_mode": "fallback", "fallback_error": "wav2lip_model_unavailable"}
 
     # ── Fallback: merge video+audio with ffmpeg, keep video at original speed ──
     print("[LipSync] Fallback: overlay audio on full-length video")
@@ -598,7 +605,7 @@ def apply_lip_sync(video_path, audio_path, output_path):
         "-shortest",
         output_path
     ], capture_output=True)
-    return output_path
+    return output_path, fallback_meta
 
 
 def handle_lip_sync(inp):
@@ -623,7 +630,7 @@ def handle_lip_sync(inp):
         f.write(base64.b64decode(audio_b64))
 
     t0 = time.time()
-    result_path = apply_lip_sync(video_path, audio_path, sync_path)
+    result_path, lipsync_meta = apply_lip_sync(video_path, audio_path, sync_path)
     lipsync_time = time.time() - t0
 
     current_path = result_path
@@ -661,7 +668,11 @@ def handle_lip_sync(inp):
     return {"video_base64": result_b64, "lip_sync_time": round(lipsync_time, 1),
             "upscale_time": round(upscale_time, 1), "total_time": round(elapsed, 1),
             "file_size_bytes": file_size, "upscaled": do_upscale,
-            "saved_to_volume": saved}
+            "saved_to_volume": saved,
+            "lipsync_mode": lipsync_meta.get("lipsync_mode", "unknown"),
+            "face_count": lipsync_meta.get("face_count", 0),
+            "processed_frames": lipsync_meta.get("processed_frames", 0),
+            "fallback_error": lipsync_meta.get("fallback_error", "")}
 
 
 def handle_download_weights(inp):
