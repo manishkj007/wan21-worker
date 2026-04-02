@@ -460,6 +460,8 @@ def _detect_cartoon_face(gray, w, h):
     Returns list of (x, y, fw, fh) face bounding boxes sorted by area (largest first).
     Falls back to centre-frame heuristic if no faces found.
     """
+    import cv2
+    import numpy as np
     faces = []
 
     # Strategy 1: Haar cascade (works well on cartoon faces with big eyes)
@@ -554,6 +556,7 @@ def _extract_audio_features(audio_path, fps, n_frames):
       consonant: high-frequency emphasis (tight mouth) [0..1]
       pitch_var: pitch variation (for expression) [0..1]
     """
+    import numpy as np
     import librosa
     sr = 22050
     wav, _ = librosa.load(audio_path, sr=sr)
