@@ -454,16 +454,190 @@ def load_wav2lip():
     return _wav2lip_model
 
 
-def apply_lip_sync(video_path, audio_path, output_path):
-    """Audio-driven cartoon lip-sync with visible mouth movement.
+def _detect_cartoon_face(gray, w, h):
+    """Detect face region in a cartoon frame using multi-strategy approach.
 
-    Two-zone warp: jaw region pulls downward (mouth opens), chin follows.
-    Dark oval mouth cavity drawn when energy is high.
-    Produces clearly visible 'talking' effect for cartoon characters.
+    Returns list of (x, y, fw, fh) face bounding boxes sorted by area (largest first).
+    Falls back to centre-frame heuristic if no faces found.
+    """
+    faces = []
+
+    # Strategy 1: Haar cascade (works well on cartoon faces with big eyes)
+    cascade_paths = [
+        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+        "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+    ]
+    import cv2
+    cascade = None
+    for cp in cascade_paths:
+        if os.path.exists(cp):
+            cascade = cv2.CascadeClassifier(cp)
+            break
+    if cascade is None:
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    if cascade is not None and not cascade.empty():
+        dets = cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3,
+                                        minSize=(w // 10, h // 10))
+        for (fx, fy, fw, fh) in dets:
+            faces.append((int(fx), int(fy), int(fw), int(fh)))
+
+    # Strategy 2: If no Haar detections, try edge-density heuristic for cartoon eyes
+    if not faces:
+        edges = cv2.Canny(gray, 60, 150)
+        # Scan for high-density eye regions (cartoon eyes = strong edges, round)
+        cell_h, cell_w = h // 6, w // 6
+        best_score, best_pos = 0, None
+        for gy in range(1, 4):  # scan upper-mid rows
+            for gx in range(1, 5):
+                patch = edges[gy * cell_h:(gy + 1) * cell_h, gx * cell_w:(gx + 1) * cell_w]
+                score = float(np.sum(patch > 0))
+                if score > best_score:
+                    best_score = score
+                    best_pos = (gx * cell_w, gy * cell_h)
+        if best_pos and best_score > cell_h * cell_w * 0.08:
+            # Build face box around detected eye region
+            ex, ey = best_pos
+            fw = int(w * 0.45)
+            fh = int(h * 0.55)
+            fx = max(0, ex - fw // 4)
+            fy = max(0, ey - fh // 5)
+            faces.append((fx, fy, fw, fh))
+
+    # Sort by area (largest first)
+    faces.sort(key=lambda f: f[2] * f[3], reverse=True)
+    return faces
+
+
+def _pick_face(faces, face_hint, w_frame, h_frame):
+    """Select the correct face based on hint from caller.
+
+    face_hint: "left", "right", "center", "largest", or "x,y" explicit coords.
+    """
+    if not faces:
+        return None
+
+    if len(faces) == 1:
+        return faces[0]
+
+    if face_hint:
+        hint = face_hint.strip().lower()
+        if "," in hint:
+            # Explicit centre coordinates
+            parts = hint.split(",")
+            tx, ty = float(parts[0]), float(parts[1])
+            best, best_d = faces[0], float("inf")
+            for f in faces:
+                cx = f[0] + f[2] / 2
+                cy = f[1] + f[3] / 2
+                d = (cx - tx) ** 2 + (cy - ty) ** 2
+                if d < best_d:
+                    best, best_d = f, d
+            return best
+        elif hint == "left":
+            return min(faces, key=lambda f: f[0] + f[2] / 2)
+        elif hint == "right":
+            return max(faces, key=lambda f: f[0] + f[2] / 2)
+        elif hint == "center":
+            return min(faces, key=lambda f: abs(f[0] + f[2] / 2 - w_frame / 2))
+
+    # Default: largest face
+    return faces[0]
+
+
+def _extract_audio_features(audio_path, fps, n_frames):
+    """Extract rich audio features: energy, vowel emphasis, consonant emphasis.
+
+    Returns dict with per-frame arrays:
+      energy:    overall RMS energy [0..1]
+      vowel:     low-frequency emphasis (open mouth) [0..1]
+      consonant: high-frequency emphasis (tight mouth) [0..1]
+      pitch_var: pitch variation (for expression) [0..1]
+    """
+    import librosa
+    sr = 22050
+    wav, _ = librosa.load(audio_path, sr=sr)
+    hop = int(sr / fps)
+
+    energy = np.zeros(n_frames, dtype=np.float32)
+    vowel = np.zeros(n_frames, dtype=np.float32)
+    consonant = np.zeros(n_frames, dtype=np.float32)
+
+    # Mel spectrogram for frequency analysis
+    n_fft = min(2048, len(wav))
+    mel = librosa.feature.melspectrogram(y=wav, sr=sr, n_fft=n_fft, hop_length=hop,
+                                         n_mels=40, fmax=8000)
+    mel_db = librosa.power_to_db(mel + 1e-10, ref=np.max)
+    mel_norm = (mel_db - mel_db.min()) / max(1, mel_db.max() - mel_db.min())
+
+    for i in range(n_frames):
+        start = i * hop
+        end = min(start + hop, len(wav))
+        if start < len(wav):
+            chunk = wav[start:end]
+            energy[i] = np.sqrt(np.mean(chunk ** 2))
+
+        if i < mel_norm.shape[1]:
+            col = mel_norm[:, i]
+            # Low mels (0-12) = vowels/open mouth
+            vowel[i] = float(np.mean(col[:12]))
+            # High mels (20-40) = consonants/fricatives
+            consonant[i] = float(np.mean(col[20:]))
+
+    # Normalize
+    for arr in [energy, vowel, consonant]:
+        mx = arr.max()
+        if mx > 0:
+            arr[:] = arr / mx
+
+    # Temporal smoothing (3-frame for responsive motion)
+    kernel = np.ones(3) / 3.0
+    energy = np.convolve(energy, kernel, mode="same").astype(np.float32)
+    vowel = np.convolve(energy, kernel, mode="same").astype(np.float32)
+    energy = np.clip(energy, 0.0, 1.0)
+    vowel = np.clip(vowel, 0.0, 1.0)
+    consonant = np.clip(consonant, 0.0, 1.0)
+
+    # Pitch variation (for eyebrow + expression)
+    try:
+        pitches, voiced = librosa.piptrack(y=wav, sr=sr, hop_length=hop, fmin=80, fmax=600)
+        pitch_per_frame = np.zeros(n_frames, dtype=np.float32)
+        for i in range(min(n_frames, pitches.shape[1])):
+            idx = pitches[:, i] > 0
+            if idx.any():
+                pitch_per_frame[i] = float(np.mean(pitches[idx, i]))
+        if pitch_per_frame.max() > 0:
+            pitch_per_frame = pitch_per_frame / pitch_per_frame.max()
+        # Variation = deviation from running mean
+        smooth_pitch = np.convolve(pitch_per_frame, np.ones(7) / 7, mode="same")
+        pitch_var = np.abs(pitch_per_frame - smooth_pitch)
+        if pitch_var.max() > 0:
+            pitch_var = pitch_var / pitch_var.max()
+    except Exception:
+        pitch_var = np.zeros(n_frames, dtype=np.float32)
+
+    return {
+        "energy": energy,
+        "vowel": vowel,
+        "consonant": consonant,
+        "pitch_var": pitch_var.astype(np.float32),
+    }
+
+
+def apply_lip_sync(video_path, audio_path, output_path, face_hint=None):
+    """Audio-driven cartoon lip-sync with face detection, expressions, and emotions.
+
+    Enhanced version with:
+    - Automatic face detection (Haar + edge fallback)
+    - Multi-face support with face_hint selection
+    - Per-face jaw warp + mouth cavity
+    - Eyebrow micro-lift during speech emphasis
+    - Eye squint on loud/emotional moments
+    - Micro head-tilt for natural animation feel
+    - Spectral audio features (vowel vs consonant shapes)
     """
     import cv2
     import numpy as np
-    import librosa
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 16
@@ -483,111 +657,214 @@ def apply_lip_sync(video_path, audio_path, output_path):
         ], capture_output=True)
         return output_path, {"lipsync_mode": "fallback", "fallback_error": "no_frames"}
 
-    # ── Audio energy per video frame ──
-    sr = 22050
-    wav, _ = librosa.load(audio_path, sr=sr)
-    hop = int(sr / fps)
-    n_frames = len(frames)
-    energy = np.zeros(n_frames, dtype=np.float32)
-    for i in range(n_frames):
-        start = i * hop
-        end = min(start + hop, len(wav))
-        if start < len(wav):
-            chunk = wav[start:end]
-            energy[i] = np.sqrt(np.mean(chunk ** 2))
-
-    if energy.max() > 0:
-        energy = energy / energy.max()
-    # Temporal smoothing (3-frame for responsive yet smooth motion)
-    kernel = np.ones(3) / 3.0
-    energy = np.convolve(energy, kernel, mode="same").astype(np.float32)
-    energy = np.clip(energy, 0.0, 1.0)
-
     h_frame, w_frame = frames[0].shape[:2]
+    n_frames = len(frames)
 
-    # ── Mouth geometry (centre-frame heuristic for cartoon characters) ──
-    mouth_cx = w_frame // 2
-    mouth_cy = int(h_frame * 0.60)           # mouth vertical centre
+    # ── Extract rich audio features ──
+    audio = _extract_audio_features(audio_path, fps, n_frames)
+    energy = audio["energy"]
+    vowel = audio["vowel"]
+    consonant = audio["consonant"]
+    pitch_var = audio["pitch_var"]
 
-    # Jaw warp zone — large ellipse covering mouth + chin area
-    jaw_rx = int(w_frame * 0.18)             # wide horizontal radius
-    jaw_ry = int(h_frame * 0.14)             # tall vertical radius
-    max_jaw_drop = max(6, int(h_frame * 0.07))  # max 7% of frame height (~34px at 480p)
+    # ── Detect face in first frame ──
+    gray0 = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+    all_faces = _detect_cartoon_face(gray0, w_frame, h_frame)
 
-    # Mouth cavity parameters (dark oval drawn on top)
-    mouth_oval_rx = int(w_frame * 0.06)      # mouth opening width
-    mouth_oval_ry_max = max(4, int(h_frame * 0.035))  # max mouth opening height
+    if all_faces:
+        face = _pick_face(all_faces, face_hint, w_frame, h_frame)
+        fx, fy, fw, fh = face
+        face_cx = fx + fw // 2
+        face_cy = fy + fh // 2
+        # Mouth sits at ~65% of face height from top
+        mouth_cx = face_cx
+        mouth_cy = fy + int(fh * 0.65)
+        # Scale warp zones relative to detected face size
+        jaw_rx = max(12, int(fw * 0.45))
+        jaw_ry = max(10, int(fh * 0.35))
+        max_jaw_drop = max(6, int(fh * 0.15))
+        mouth_oval_rx = max(6, int(fw * 0.15))
+        mouth_oval_ry_max = max(4, int(fh * 0.08))
+        # Eye region (for expression warp: top 40% of face)
+        eye_cy = fy + int(fh * 0.32)
+        eye_rx = int(fw * 0.4)
+        eye_ry = int(fh * 0.12)
+        # Eyebrow region (above eyes)
+        brow_cy = fy + int(fh * 0.22)
+        brow_rx = int(fw * 0.35)
+        brow_ry = int(fh * 0.08)
+        face_detected = True
+        detection = f"{fx},{fy},{fw},{fh}"
+        print(f"[LipSync] Face detected at ({fx},{fy}) {fw}x{fh}, mouth=({mouth_cx},{mouth_cy})")
+    else:
+        # Fallback: centre-frame heuristic
+        mouth_cx = w_frame // 2
+        mouth_cy = int(h_frame * 0.60)
+        jaw_rx = int(w_frame * 0.18)
+        jaw_ry = int(h_frame * 0.14)
+        max_jaw_drop = max(6, int(h_frame * 0.07))
+        mouth_oval_rx = int(w_frame * 0.06)
+        mouth_oval_ry_max = max(4, int(h_frame * 0.035))
+        eye_cy = int(h_frame * 0.38)
+        eye_rx = int(w_frame * 0.15)
+        eye_ry = int(h_frame * 0.06)
+        brow_cy = int(h_frame * 0.30)
+        brow_rx = int(w_frame * 0.13)
+        brow_ry = int(h_frame * 0.05)
+        face_detected = False
+        detection = "centre_heuristic"
+        print(f"[LipSync] No face detected, using centre heuristic mouth=({mouth_cx},{mouth_cy})")
 
-    # Pre-compute coordinate grids
+    # ── Track face across frames via template matching ──
+    # Extract small patch around mouth region from frame 0 for tracking
+    track_pad = max(jaw_rx, jaw_ry)
+    tmpl_y1 = max(0, mouth_cy - track_pad)
+    tmpl_y2 = min(h_frame, mouth_cy + track_pad)
+    tmpl_x1 = max(0, mouth_cx - track_pad)
+    tmpl_x2 = min(w_frame, mouth_cx + track_pad)
+    face_template = gray0[tmpl_y1:tmpl_y2, tmpl_x1:tmpl_x2].copy()
+
+    # Per-frame mouth positions (tracked)
+    mouth_positions = [(mouth_cx, mouth_cy)]
+    search_expand = int(track_pad * 0.6)
+    prev_cx, prev_cy = mouth_cx, mouth_cy
+    for i in range(1, n_frames):
+        gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+        th, tw = face_template.shape
+        sx1 = max(0, prev_cx - track_pad - search_expand)
+        sy1 = max(0, prev_cy - track_pad - search_expand)
+        sx2 = min(w_frame, prev_cx + track_pad + search_expand)
+        sy2 = min(h_frame, prev_cy + track_pad + search_expand)
+        region = gray[sy1:sy2, sx1:sx2]
+        if region.shape[0] >= th and region.shape[1] >= tw:
+            res = cv2.matchTemplate(region, face_template, cv2.TM_CCOEFF_NORMED)
+            _, val, _, loc = cv2.minMaxLoc(res)
+            if val > 0.3:
+                nx = sx1 + loc[0] + tw // 2
+                ny = sy1 + loc[1] + th // 2
+                # Smooth: 70% new + 30% previous
+                cx_t = int(prev_cx * 0.3 + nx * 0.7)
+                cy_t = int(prev_cy * 0.3 + ny * 0.7)
+                mouth_positions.append((cx_t, cy_t))
+                prev_cx, prev_cy = cx_t, cy_t
+                continue
+        mouth_positions.append((prev_cx, prev_cy))
+
+    # ── Pre-compute base grids ──
     ys = np.arange(h_frame, dtype=np.float32)[:, np.newaxis]
     xs = np.arange(w_frame, dtype=np.float32)[np.newaxis, :]
-
-    # Jaw warp: only push DOWNWARD for pixels BELOW mouth_cy (jaw drop)
-    # Pixels above mouth_cy stay put (upper face doesn't move)
-    dy_from_mouth = (ys - mouth_cy) / max(jaw_ry, 1)        # (H,1)
-    dx_from_mouth = (xs - mouth_cx) / max(jaw_rx, 1)        # (1,W)
-    jaw_r2 = dx_from_mouth ** 2 + dy_from_mouth ** 2        # (H,W)
-
-    # Strength: cosine falloff inside ellipse, only for below-mouth pixels
-    below_mouth = (ys > mouth_cy).astype(np.float32)        # 1 below, 0 above
-    jaw_inside = (jaw_r2 < 1.0).astype(np.float32)
-    jaw_strength = jaw_inside * below_mouth * np.where(
-        jaw_r2 < 1.0,
-        0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(jaw_r2, 0, 1)))),
-        0.0
-    ).astype(np.float32)
-
-    # Upper lip lift: slight upward pull just above mouth line
-    above_zone = ((ys > mouth_cy - jaw_ry * 0.4) & (ys <= mouth_cy)).astype(np.float32)
-    lip_dist = np.abs(ys - mouth_cy) / max(jaw_ry * 0.4, 1)
-    lip_strength = above_zone * jaw_inside * np.where(
-        lip_dist < 1.0,
-        0.5 * (1.0 + np.cos(np.pi * np.clip(lip_dist, 0, 1))),
-        0.0
-    ).astype(np.float32) * 0.3   # upper lip moves 30% as much as jaw
-
-    # Base remap grids
     map_x_base = np.repeat(xs, h_frame, axis=0).astype(np.float32)
     map_y_base = np.repeat(ys, w_frame, axis=1).astype(np.float32)
 
-    # Pre-compute mouth cavity mask (ellipse around mouth centre)
-    mouth_dy = (ys - mouth_cy) / max(1, 1)   # will be scaled per-frame
-    mouth_dx = (xs - mouth_cx) / max(mouth_oval_rx, 1)
-
     result_frames = []
+    active_count = 0
+
     for idx, frame in enumerate(frames):
-        e = float(energy[idx]) if idx < len(energy) else 0.0
-        if e < 0.08:
+        e = float(energy[idx]) if idx < n_frames else 0.0
+        v = float(vowel[idx]) if idx < n_frames else 0.0
+        c_val = float(consonant[idx]) if idx < n_frames else 0.0
+        pv = float(pitch_var[idx]) if idx < n_frames else 0.0
+
+        if e < 0.06:
             result_frames.append(frame)
             continue
 
-        # ── Jaw drop warp ──
-        drop = e * max_jaw_drop
-        # Jaw drops down, upper lip lifts up slightly
+        active_count += 1
+        mcx, mcy = mouth_positions[idx]
+
+        # ── Jaw zone (per-frame position) ──
+        dy_from_mouth = (ys - mcy) / max(jaw_ry, 1)
+        dx_from_mouth = (xs - mcx) / max(jaw_rx, 1)
+        jaw_r2 = dx_from_mouth ** 2 + dy_from_mouth ** 2
+
+        below_mouth = (ys > mcy).astype(np.float32)
+        jaw_inside = (jaw_r2 < 1.0).astype(np.float32)
+        cosine_falloff = np.where(
+            jaw_r2 < 1.0,
+            0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(jaw_r2, 0, 1)))),
+            0.0
+        ).astype(np.float32)
+        jaw_strength = jaw_inside * below_mouth * cosine_falloff
+
+        # Upper lip lift zone
+        above_zone = ((ys > mcy - jaw_ry * 0.4) & (ys <= mcy)).astype(np.float32)
+        lip_dist = np.abs(ys - mcy) / max(jaw_ry * 0.4, 1)
+        lip_strength = above_zone * jaw_inside * np.where(
+            lip_dist < 1.0,
+            0.5 * (1.0 + np.cos(np.pi * np.clip(lip_dist, 0, 1))),
+            0.0
+        ).astype(np.float32) * 0.3
+
+        # ── Vowel = wide open jaw; Consonant = tighter, less drop ──
+        vowel_factor = max(v, 0.3)  # vowels open wide
+        drop = e * max_jaw_drop * (0.6 + 0.4 * vowel_factor)
+
         disp_y = jaw_strength * drop - lip_strength * drop
+        # Horizontal stretch: vowels widen more, consonants narrow
+        h_stretch = jaw_strength * e * (0.12 + 0.08 * vowel_factor - 0.05 * c_val)
+        disp_x = dx_from_mouth * jaw_rx * h_stretch
+
+        # ── Expression: eyebrow lift on emphasis / pitch changes ──
+        brow_amount = max(pv * 0.4, e * 0.15) * max_jaw_drop * 0.3
+        if brow_amount > 1.0:
+            dy_brow = (ys - brow_cy) / max(brow_ry, 1)
+            dx_brow = (xs - mcx) / max(brow_rx, 1)
+            brow_r2 = dx_brow ** 2 + dy_brow ** 2
+            brow_mask = np.where(
+                brow_r2 < 1.0,
+                0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(brow_r2, 0, 1)))),
+                0.0
+            ).astype(np.float32)
+            # Only lift pixels above brow centre (eyebrows go UP)
+            brow_above = (ys < brow_cy + brow_ry * 0.3).astype(np.float32)
+            disp_y = disp_y - brow_mask * brow_above * brow_amount
+
+        # ── Expression: subtle eye squint on loud moments ──
+        squint_amount = max(0, e - 0.6) * max_jaw_drop * 0.15
+        if squint_amount > 0.5:
+            dy_eye = (ys - eye_cy) / max(eye_ry, 1)
+            dx_eye = (xs - mcx) / max(eye_rx, 1)
+            eye_r2 = dx_eye ** 2 + dy_eye ** 2
+            eye_mask = np.where(
+                eye_r2 < 1.0,
+                0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(eye_r2, 0, 1)))),
+                0.0
+            ).astype(np.float32)
+            # Push lower eyelid UP slightly (squint)
+            below_eye = (ys > eye_cy).astype(np.float32)
+            disp_y = disp_y - eye_mask * below_eye * squint_amount
+
+        # ── Micro head tilt (subtle sine oscillation for life-like feel) ──
+        tilt_phase = idx / max(fps, 1) * 2.5  # slow oscillation
+        tilt_amount = e * 0.8  # only when speaking
+        micro_tilt = np.sin(tilt_phase) * tilt_amount
+        # Tilt = small rotation → left side up, right side down
+        tilt_disp = (xs - mcx) / max(w_frame * 0.5, 1) * micro_tilt
+        disp_y = disp_y + tilt_disp
+
         map_y = (map_y_base - disp_y).astype(np.float32)
-        # Slight horizontal stretch at jaw (mouth widens when open)
-        horiz_stretch = jaw_strength * e * 0.15
-        disp_x = dx_from_mouth * jaw_rx * horiz_stretch
         map_x = (map_x_base - disp_x).astype(np.float32)
 
         warped = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR,
                            borderMode=cv2.BORDER_REFLECT_101)
 
-        # ── Draw dark mouth cavity oval ──
-        oval_ry = max(2, int(mouth_oval_ry_max * e))
+        # ── Mouth cavity (dark oval) — shape depends on vowel vs consonant ──
+        # Vowels: tall oval (open mouth); Consonants: wide but flat
+        oval_ry = max(2, int(mouth_oval_ry_max * e * (0.5 + 0.5 * vowel_factor)))
+        oval_rx_frame = max(4, int(mouth_oval_rx * (0.7 + 0.3 * vowel_factor + 0.2 * c_val)))
         if oval_ry > 2:
-            # Elliptical mask for mouth interior
-            m_r2 = mouth_dx ** 2 + ((ys - mouth_cy) / max(oval_ry, 1)) ** 2
-            # Soft edge: cosine falloff
+            m_dx = (xs - mcx) / max(oval_rx_frame, 1)
+            m_dy = (ys - mcy) / max(oval_ry, 1)
+            m_r2 = m_dx ** 2 + m_dy ** 2
             cavity_mask = np.where(
                 m_r2 < 1.0,
                 0.5 * (1.0 + np.cos(np.pi * np.sqrt(np.clip(m_r2, 0, 1)))),
                 0.0
             ).astype(np.float32)
-            # Darken: blend towards dark reddish-brown (cartoon mouth interior)
             cavity_strength = cavity_mask * min(e * 1.2, 0.85)
-            mouth_color = np.array([30, 20, 45], dtype=np.float32)  # dark interior (BGR)
+            # Mouth colour: slightly warmer for vowels
+            mouth_color = np.array([30 + int(10 * v), 20, 45 + int(15 * v)],
+                                   dtype=np.float32)
             warped = (
                 warped.astype(np.float32) * (1.0 - cavity_strength[:, :, np.newaxis])
                 + mouth_color[np.newaxis, np.newaxis, :] * cavity_strength[:, :, np.newaxis]
@@ -611,17 +888,26 @@ def apply_lip_sync(video_path, audio_path, output_path):
     if os.path.exists(final):
         os.replace(final, output_path)
 
-    processed = sum(1 for e in energy if e >= 0.08)
-    print(f"[MouthMorph] Done — {len(result_frames)} frames, {processed} morphed")
+    processed = int(active_count)
+    print(f"[LipSync] Done — {len(result_frames)} frames, {processed} morphed, "
+          f"face={'detected' if face_detected else 'heuristic'} at {detection}")
     return output_path, {
-        "lipsync_mode": "mouth_morph",
-        "face_count": 1,
-        "processed_frames": int(processed),
+        "lipsync_mode": "face_detect_morph",
+        "face_count": len(all_faces) if face_detected else 0,
+        "face_detected": face_detected,
+        "face_box": detection,
+        "processed_frames": processed,
     }
 
 
 def handle_lip_sync(inp):
-    """Lip-sync: video + audio → synced video. Optional upscale after."""
+    """Lip-sync: video + audio → synced video. Optional upscale after.
+
+    New parameters:
+      face_hint: "left", "right", "center", "largest", or "x,y" coords
+                 Tells the face picker which character is speaking.
+      character_name: Informational — logged for debugging.
+    """
     video_b64 = inp.get("video_base64", "")
     audio_b64 = inp.get("audio_base64", "")
     if not video_b64 or not audio_b64:
@@ -630,6 +916,11 @@ def handle_lip_sync(inp):
     do_upscale = inp.get("upscale", False)
     target_height = int(inp.get("target_height", 1080))
     output_name = inp.get("output_name", "")
+    face_hint = inp.get("face_hint", "")
+    character_name = inp.get("character_name", "")
+
+    if character_name:
+        print(f"[LipSync] Character: {character_name}, face_hint: {face_hint}")
 
     job_id = str(uuid.uuid4())
     video_path = f"{TMPDIR}/{job_id}_video.mp4"
@@ -642,7 +933,8 @@ def handle_lip_sync(inp):
         f.write(base64.b64decode(audio_b64))
 
     t0 = time.time()
-    result_path, lipsync_meta = apply_lip_sync(video_path, audio_path, sync_path)
+    result_path, lipsync_meta = apply_lip_sync(video_path, audio_path, sync_path,
+                                                face_hint=face_hint or None)
     lipsync_time = time.time() - t0
 
     current_path = result_path
@@ -681,8 +973,11 @@ def handle_lip_sync(inp):
             "upscale_time": round(upscale_time, 1), "total_time": round(elapsed, 1),
             "file_size_bytes": file_size, "upscaled": do_upscale,
             "saved_to_volume": saved,
+            "character_name": character_name,
             "lipsync_mode": lipsync_meta.get("lipsync_mode", "unknown"),
             "face_count": lipsync_meta.get("face_count", 0),
+            "face_detected": lipsync_meta.get("face_detected", False),
+            "face_box": lipsync_meta.get("face_box", ""),
             "processed_frames": lipsync_meta.get("processed_frames", 0),
             "fallback_error": lipsync_meta.get("fallback_error", "")}
 
