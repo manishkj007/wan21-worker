@@ -402,7 +402,7 @@ def handle_upscale(inp):
 
     saved = ""
     if output_name:
-        save_to_volume(result_bytes, output_name)
+        save_to_volume(result_b64, output_name)
         saved = f"{output_name}.mp4"
 
     for p in glob.glob(f"{TMPDIR}/{job_id}*"):
@@ -965,7 +965,7 @@ def handle_lip_sync(inp):
 
     saved = ""
     if output_name:
-        save_to_volume(result_bytes, output_name)
+        save_to_volume(result_b64, output_name)
         saved = f"{output_name}.mp4"
 
     for p in glob.glob(f"{TMPDIR}/{job_id}*"):
